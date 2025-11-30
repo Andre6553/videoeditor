@@ -1,0 +1,5 @@
+{
+  "name": "AI Reel Editor",
+  "description": "An Instagram video reel editor with a timeline for cutting and trimming, multiple templates, and AI-powered caption generation. Styled with a dark mode theme inspired by professional video editing software.",
+  "requestFramePermissions": []
+}

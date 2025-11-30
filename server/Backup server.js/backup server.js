@@ -1,0 +1,620 @@
+const express = require('express');
+const multer = require('multer');
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpegPath = require('ffmpeg-static');
+const ffprobePath = require('ffprobe-static').path;
+const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+
+// Set ffmpeg paths
+ffmpeg.setFfmpegPath(ffmpegPath);
+ffmpeg.setFfprobePath(ffprobePath);
+
+const app = express();
+const PORT = 3001;
+
+// Enable CORS and Security Headers
+app.use(cors());
+app.use(express.json({ limit: '50mb' })); // For timeline data
+app.use((req, res, next) => {
+    res.header("Cross-Origin-Opener-Policy", "same-origin");
+    res.header("Cross-Origin-Embedder-Policy", "require-corp");
+    res.header("Cross-Origin-Resource-Policy", "cross-origin");
+    next();
+});
+
+// Create uploads, outputs, and exports directories
+const uploadsDir = path.join(__dirname, 'uploads');
+const outputsDir = path.join(__dirname, 'outputs');
+const exportsDir = path.join(__dirname, 'exports');
+
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
+if (!fs.existsSync(outputsDir)) fs.mkdirSync(outputsDir);
+if (!fs.existsSync(exportsDir)) fs.mkdirSync(exportsDir);
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, uploadsDir);
+    },
+    filename: (req, file, cb) => {
+        const uniqueName = `${Date.now()}-${file.originalname}`;
+        cb(null, uniqueName);
+    }
+});
+
+const upload = multer({ storage });
+
+// In-memory job store
+const jobs = new Map();
+
+// Process video endpoint - Starts the job
+app.post('/process-video', upload.single('video'), (req, res) => {
+    const { targetFps, speed } = req.body;
+    const inputPath = req.file.path;
+    const jobId = Date.now().toString();
+    const outputFilename = `processed-${jobId}.mp4`;
+    const outputPath = path.join(outputsDir, outputFilename);
+
+    console.log(`Starting job ${jobId}: ${inputPath}`);
+
+    // Initialize job
+    jobs.set(jobId, {
+        status: 'processing',
+        progress: 0,
+        outputPath,
+        inputPath,
+        filename: outputFilename
+    });
+
+    // Start processing asynchronously
+    (async () => {
+        try {
+            // Get input video duration first
+            ffmpeg.ffprobe(inputPath, (err, metadata) => {
+                if (err) {
+                    console.error('Error reading metadata:', err);
+                    const job = jobs.get(jobId);
+                    if (job) {
+                        job.status = 'error';
+                        job.error = 'Failed to read video metadata';
+                        jobs.set(jobId, job);
+                    }
+                    return;
+                }
+
+                const duration = metadata.format.duration;
+                const expectedDuration = duration / parseFloat(speed);
+
+                const setptsVal = (1 / parseFloat(speed)).toFixed(2);
+                const fps = parseInt(targetFps);
+
+                // Two-step approach: 
+                // 1. Interpolate to target FPS 
+                // 2. Apply slow-motion timing (setpts)
+                // This prevents black frames by ensuring enough frames are generated first
+                const videoFilter = `minterpolate=fps=${fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff,setpts=${setptsVal}*PTS`;
+
+                let audioFilter = '';
+                const speedNum = parseFloat(speed);
+                if (speedNum === 0.5) audioFilter = 'atempo=0.5';
+                else if (speedNum === 0.25) audioFilter = 'atempo=0.5,atempo=0.5';
+                else if (speedNum === 2) audioFilter = 'atempo=2.0';
+                else if (speedNum < 0.5) audioFilter = 'atempo=0.5,atempo=0.5';
+                else if (speedNum > 2) audioFilter = 'atempo=2.0';
+                else audioFilter = `atempo=${speedNum}`;
+
+                // Add safeguards to audio processing
+                audioFilter += ',volume=0.98,aresample=48000:async=1';
+
+                ffmpeg(inputPath)
+                    .videoFilters(videoFilter)
+                    .audioFilters(audioFilter)
+                    .outputOptions([
+                        '-c:v', 'libx264',      // Force H.264 codec
+                        '-pix_fmt', 'yuv420p',  // Force YUV420p pixel format (required for broad browser support)
+                        '-movflags', '+faststart', // Optimize for web playback
+                        '-max_muxing_queue_size', '9999',
+                        '-ac', '2',             // Force 2 audio channels
+                        '-ar', '48000',         // Force 48kHz audio sample rate
+                        '-c:a', 'aac',          // Force AAC codec
+                        '-b:a', '320k',         // High bitrate
+                        '-threads', Math.max(1, require('os').cpus().length - 1).toString()
+                    ])
+                    .output(outputPath)
+                    .on('progress', (progress) => {
+                        const job = jobs.get(jobId);
+                        if (job && job.status !== 'done' && job.status !== 'error') {
+                            // Calculate progress based on time mark and expected duration
+                            if (progress.timemark) {
+                                const timeParts = progress.timemark.split(':');
+                                const seconds = (+timeParts[0]) * 60 * 60 + (+timeParts[1]) * 60 + (+timeParts[2]);
+                                const percent = (seconds / expectedDuration) * 100;
+                                job.progress = Math.max(0, Math.min(99, percent));
+                                jobs.set(jobId, job);
+                            }
+                        }
+                    })
+                    .on('error', (err) => {
+                        console.error(`Job ${jobId} failed:`, err);
+                        const job = jobs.get(jobId);
+                        if (job) {
+                            job.status = 'error';
+                            job.error = err.message;
+                            jobs.set(jobId, job);
+                        }
+                        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+                        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+                    })
+                    .run();
+            });
+
+        } catch (error) {
+            console.error(`Job ${jobId} error:`, error);
+            const job = jobs.get(jobId);
+            if (job) {
+                job.status = 'error';
+                job.error = error.message;
+                jobs.set(jobId, job);
+            }
+        }
+    })();
+
+    // Return Job ID immediately
+    res.json({ jobId });
+});
+
+// SSE Endpoint for progress updates
+app.get('/progress/:jobId', (req, res) => {
+    const { jobId } = req.params;
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    const sendUpdate = () => {
+        const job = jobs.get(jobId);
+        if (!job) {
+            res.write(`data: ${JSON.stringify({ status: 'error', error: 'Job not found' })}\n\n`);
+            res.end();
+            return;
+        }
+
+        res.write(`data: ${JSON.stringify({ status: job.status, progress: job.progress })}\n\n`);
+
+        if (job.status === 'done' || job.status === 'error') {
+            res.end();
+        }
+    };
+
+    // Send initial update
+    sendUpdate();
+
+    // Poll for updates every 500ms
+    const interval = setInterval(sendUpdate, 500);
+
+    req.on('close', () => {
+        clearInterval(interval);
+    });
+});
+
+// Download endpoint
+app.get('/download/:jobId', (req, res) => {
+    const { jobId } = req.params;
+    const job = jobs.get(jobId);
+
+    if (!job || job.status !== 'done' || !fs.existsSync(job.outputPath)) {
+        return res.status(404).send('File not ready or not found');
+    }
+
+    res.setHeader('Content-Disposition', `inline; filename="${job.filename}"`);
+    res.sendFile(job.outputPath);
+});
+// Helper: Process a single clip into a standardized intermediate chunk
+const processClipForExport = (clip, sourcePath, outputDir, index, volume = 1) => {
+    return new Promise((resolve, reject) => {
+        const chunkFilename = `chunk_${index}_${Date.now()}.mov`;
+        const chunkPath = path.join(outputDir, chunkFilename);
+
+        // Calculate trim duration
+        const duration = clip.sourceEnd - clip.sourceStart;
+        const paddedDuration = duration + 0.133;
+
+        // Build filters
+        const videoFilters = [];
+        const audioFilters = [];
+
+        // 1. Trimming
+        videoFilters.push(`trim=start=${clip.sourceStart}:duration=${paddedDuration}`);
+        videoFilters.push(`setpts=PTS-STARTPTS`);
+        // Note: setpts moved to after fps filter for better stability
+
+        audioFilters.push(`atrim=start=${clip.sourceStart}:duration=${paddedDuration}`);
+        audioFilters.push(`asetpts=PTS-STARTPTS`);
+        audioFilters.push(`apad=pad_dur=0.133`);
+
+        // 2. Scaling & Cropping (Standardize to 1080x1920)
+        videoFilters.push(`scale=1080:1920:force_original_aspect_ratio=increase`);
+        videoFilters.push(`crop=1080:1920:(iw-1080)/2:(ih-1920)/2`);
+        videoFilters.push(`setsar=1`);
+
+        // 3. Frame Rate (Standardize to 30fps)
+        // This ensures all chunks are identical for concatenation
+        videoFilters.push(`fps=30`);
+        // FORCE RE-TIMESTAMPS: Generate perfect timestamps after frame rate conversion
+        videoFilters.push(`setpts=N/30/TB`);
+
+        // 4. Audio Volume & Normalization
+        audioFilters.push(`aresample=48000`);
+        // Apply user volume
+        if (volume !== 1) {
+            audioFilters.push(`volume=${volume}`);
+        }
+        // Soft Limiter to prevent clipping (instead of aggressive loudnorm)
+        audioFilters.push(`alimiter=limit=0.95:attack=5:release=50:asc=1`);
+
+        // Build the command
+        const command = ffmpeg(sourcePath)
+            .videoFilters(videoFilters.join(','))
+            .outputOptions([
+                '-r', '30',             // Force exact 30 fps output
+                '-vsync', 'cfr',        // Force constant frame rate
+                '-c:v', 'prores_ks',    // ProRes codec (lossless/intermediate)
+                '-profile:v', '3',      // ProRes 422 HQ
+                '-pix_fmt', 'yuv422p10le', // 10-bit color depth
+                '-vendor', 'ap10'       // Apple compatibility
+            ]);
+        // Check if source has audio by probing
+        ffmpeg.ffprobe(sourcePath, (err, metadata) => {
+            if (err) {
+                reject(err);
+                return;
+            }
+
+            const hasAudio = metadata.streams.some(s => s.codec_type === 'audio');
+
+            if (hasAudio) {
+                // Source has audio - process it normally
+                command
+                    .audioFilters(audioFilters.join(','))
+                    .outputOptions([
+                        '-c:a', 'pcm_s16le',    // Uncompressed PCM audio
+                        '-ac', '2',
+                        '-ar', '48000'
+                    ])
+                    .output(chunkPath)
+                    .on('end', () => resolve(chunkPath))
+                    .on('error', (err) => reject(err))
+                    .run();
+            } else {
+                // Source has no audio (e.g., image) - generate silent audio
+                // We need to use filter_complex to add silent audio stream
+                const silentAudioFilter = `anullsrc=channel_layout=stereo:sample_rate=48000:duration=${paddedDuration}`;
+                const complexFilter = `${videoFilters.join(',')};${silentAudioFilter}[a]`;
+
+                ffmpeg(sourcePath)
+                    .complexFilter(complexFilter)
+                    .outputOptions([
+                        '-map', '[v]',          // Map the processed video
+                        '-map', '[a]',          // Map the generated silent audio
+                        '-r', '30',
+                        '-vsync', 'cfr',
+                        '-c:v', 'prores_ks',    // ProRes codec
+                        '-profile:v', '3',      // ProRes 422 HQ
+                        '-pix_fmt', 'yuv422p10le',
+                        '-vendor', 'ap10',
+                        '-c:a', 'pcm_s16le',
+                        '-ac', '2',
+                        '-ar', '48000',
+                        '-shortest'             // Match video duration
+                    ])
+                    .output(chunkPath)
+                    .on('end', () => resolve(chunkPath))
+                    .on('error', (err) => reject(err))
+                    .run();
+            }
+        });
+    });
+};
+
+// Export video endpoint - Background rendering
+app.post('/export', upload.fields([
+    { name: 'timeline', maxCount: 1 },
+    { name: 'videos', maxCount: 10 }
+]), async (req, res) => {
+    try {
+        const exportId = Date.now().toString();
+        const timelineData = JSON.parse(req.body.timeline);
+        const { videoTracks, duration, template } = timelineData;
+
+        const outputFilename = `export-${exportId}.mp4`;
+        const outputPath = path.join(exportsDir, outputFilename);
+
+        // Create a temp directory for this export job
+        const jobTempDir = path.join(uploadsDir, `export-temp-${exportId}`);
+        if (!fs.existsSync(jobTempDir)) fs.mkdirSync(jobTempDir);
+
+        console.log(`Starting export ${exportId} (Intermediate Workflow)`);
+
+        // Initialize export job
+        jobs.set(exportId, {
+            status: 'processing',
+            progress: 0,
+            outputPath,
+            filename: outputFilename,
+            type: 'export'
+        });
+
+        // Return export ID immediately
+        res.json({ exportId });
+
+        // Start export asynchronously
+        (async () => {
+            try {
+                // Phase 1: Solo layout only (single video track)
+                if (template.layout !== 'solo' || videoTracks.length !== 1) {
+                    throw new Error('Phase 1 only supports solo layout with one video track');
+                }
+
+                const track = videoTracks[0];
+                if (track.clips.length === 0) {
+                    throw new Error('No clips to export');
+                }
+
+                const chunkPaths = [];
+                const totalClips = track.clips.length;
+
+                // Step 1: Process each clip into an intermediate chunk
+                for (let i = 0; i < totalClips; i++) {
+                    const clip = track.clips[i];
+
+                    // Determine source path
+                    let videoPath;
+                    if (clip.processedVideoUrl) {
+                        const jobId = clip.processedVideoUrl.split('/download/')[1];
+                        const processJob = jobs.get(jobId);
+                        if (processJob && fs.existsSync(processJob.outputPath)) {
+                            videoPath = processJob.outputPath;
+                        } else {
+                            throw new Error(`Processed video not found for clip ${clip.id}`);
+                        }
+                    } else {
+                        const uploadedFile = req.files?.videos?.find(f => f.filename && f.filename.includes(clip.mediaFileId));
+                        if (uploadedFile) {
+                            videoPath = uploadedFile.path;
+                        } else {
+                            throw new Error(`Video file not found for clip ${clip.id}`);
+                        }
+                    }
+
+                    // Update progress (0-80% for processing chunks)
+                    const job = jobs.get(exportId);
+                    if (job) {
+                        job.progress = Math.floor((i / totalClips) * 80);
+                        jobs.set(exportId, job);
+                    }
+
+                    // Calculate volume
+                    const trackVolume = track.volume ?? 1;
+                    const clipVolume = clip.volume ?? 1;
+                    const finalVolume = trackVolume * clipVolume;
+
+                    console.log(`Processing clip ${i + 1}/${totalClips}... Volume: ${finalVolume}`);
+                    const chunkPath = await processClipForExport(clip, videoPath, jobTempDir, i, finalVolume);
+                    chunkPaths.push(chunkPath);
+                }
+
+                // Step 2: Use Concat Demuxer (Bit-perfect stream joining)
+                console.log('Concatenating chunks with concat demuxer...');
+
+                // Update progress (80-90%)
+                const job = jobs.get(exportId);
+                if (job) {
+                    job.progress = 85;
+                    jobs.set(exportId, job);
+                }
+
+                // Create concat list file
+                const concatListPath = path.join(jobTempDir, 'concat_list.txt');
+                // Escape paths for FFmpeg concat file
+                const concatFileContent = chunkPaths.map(p => {
+                    // Replace backslashes with forward slashes and escape single quotes
+                    const safePath = p.replace(/\\/g, '/').replace(/'/g, "'\\''");
+                    return `file '${safePath}'`;
+                }).join('\n');
+
+                fs.writeFileSync(concatListPath, concatFileContent);
+
+                await new Promise((resolve, reject) => {
+                    ffmpeg()
+                        .input(concatListPath)
+                        .inputOptions(['-f concat', '-safe 0'])
+                        .outputOptions([
+                            '-c:v', 'libx264',      // H.264 video codec
+                            '-preset', 'medium',    // Medium preset
+                            '-crf', '18',           // Visually lossless
+                            '-maxrate', '15M',
+                            '-bufsize', '30M',
+                            '-profile:v', 'high',
+                            '-level', '4.2',
+                            '-pix_fmt', 'yuv420p',  // Ensure 8-bit output (crucial since input is 10-bit ProRes)
+                            '-g', '60',
+                            '-movflags', '+faststart',
+                            '-c:a', 'aac',          // AAC audio codec
+                            '-b:a', '320k',         // High bitrate
+                            '-ar', '48000',
+                            '-ac', '2'
+                        ])
+                        .audioFilters('aresample=async=1:min_hard_comp=0.100000:first_pts=0')
+                        .output(outputPath)
+                        .on('end', resolve)
+                        .on('error', reject)
+                        .run();
+                });
+
+                // Cleanup Temp Files
+                try {
+                    fs.rmSync(jobTempDir, { recursive: true, force: true });
+                } catch (e) {
+                    console.error('Error cleaning up temp dir:', e);
+                }
+
+                console.log(`Export ${exportId} completed`);
+                const finalJob = jobs.get(exportId);
+                if (finalJob) {
+                    finalJob.status = 'done';
+                    finalJob.progress = 100;
+                    jobs.set(exportId, finalJob);
+                }
+
+            } catch (error) {
+                console.error(`Export ${exportId} error:`, error);
+                const job = jobs.get(exportId);
+                if (job) {
+                    job.status = 'error';
+                    job.error = error.message;
+                    jobs.set(exportId, job);
+                }
+                // Attempt cleanup on error
+                if (fs.existsSync(jobTempDir)) {
+                    try { fs.rmSync(jobTempDir, { recursive: true, force: true }); } catch (e) { }
+                }
+            }
+        })();
+
+    } catch (error) {
+        console.error('Export request error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Export progress endpoint (SSE)
+app.get('/export-progress/:exportId', (req, res) => {
+    const { exportId } = req.params;
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    const sendUpdate = () => {
+        const job = jobs.get(exportId);
+        if (!job || job.type !== 'export') {
+            res.write(`data: ${JSON.stringify({ status: 'error', error: 'Export not found' })}\n\n`);
+            res.end();
+            return;
+        }
+
+        res.write(`data: ${JSON.stringify({ status: job.status, progress: job.progress })}\n\n`);
+
+        if (job.status === 'done' || job.status === 'error') {
+            res.end();
+        }
+    };
+
+    // Send initial update
+    sendUpdate();
+
+    // Poll for updates every 500ms
+    const interval = setInterval(sendUpdate, 500);
+
+    req.on('close', () => {
+        clearInterval(interval);
+    });
+});
+
+// Download export endpoint
+app.get('/download-export/:exportId', (req, res) => {
+    const { exportId } = req.params;
+    const job = jobs.get(exportId);
+
+    if (!job || job.type !== 'export' || job.status !== 'done' || !fs.existsSync(job.outputPath)) {
+        return res.status(404).send('Export not ready or not found');
+    }
+
+    res.setHeader('Content-Disposition', `attachment; filename="${job.filename}"`);
+    res.sendFile(job.outputPath);
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', message: 'Server is running' });
+});
+
+// Cache status endpoint - checks if there are files to clear
+app.get('/cache-status', (req, res) => {
+    try {
+        let fileCount = 0;
+
+        if (fs.existsSync(outputsDir)) {
+            fileCount += fs.readdirSync(outputsDir).length;
+        }
+        if (fs.existsSync(exportsDir)) {
+            fileCount += fs.readdirSync(exportsDir).length;
+        }
+        if (fs.existsSync(uploadsDir)) {
+            fileCount += fs.readdirSync(uploadsDir).length;
+        }
+
+        res.json({ hasCache: fileCount > 0, fileCount });
+    } catch (error) {
+        console.error('Error checking cache status:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Clear cache endpoint - deletes all processed videos and exports
+app.post('/clear-cache', (req, res) => {
+    try {
+        let deletedCount = 0;
+
+        // Clear outputs directory (processed slow-mo videos)
+        if (fs.existsSync(outputsDir)) {
+            const outputFiles = fs.readdirSync(outputsDir);
+            outputFiles.forEach(file => {
+                const filePath = path.join(outputsDir, file);
+                fs.unlinkSync(filePath);
+                deletedCount++;
+            });
+        }
+
+        // Clear exports directory (rendered final videos)
+        if (fs.existsSync(exportsDir)) {
+            const exportFiles = fs.readdirSync(exportsDir);
+            exportFiles.forEach(file => {
+                const filePath = path.join(exportsDir, file);
+                fs.unlinkSync(filePath);
+                deletedCount++;
+            });
+        }
+
+        // Clear uploads directory (temporary uploaded files)
+        if (fs.existsSync(uploadsDir)) {
+            const uploadFiles = fs.readdirSync(uploadsDir);
+            uploadFiles.forEach(file => {
+                const filePath = path.join(uploadsDir, file);
+                fs.unlinkSync(filePath);
+                deletedCount++;
+            });
+        }
+
+        // Clear in-memory job store
+        jobs.clear();
+
+        console.log(`Cache cleared: ${deletedCount} files deleted`);
+        res.json({ success: true, filesDeleted: deletedCount });
+    } catch (error) {
+        console.error('Error clearing cache:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+    res.send('AI Reel Editor Video Processing Server is running');
+});
+
+app.listen(PORT, () => {
+    console.log(`Video processing server running on http://localhost:${PORT}`);
+    console.log('Ready to process videos!');
+});
